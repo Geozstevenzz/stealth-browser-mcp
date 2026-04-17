@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import time
 from typing import List, Optional, Dict, Any
 
@@ -194,6 +195,50 @@ class DOMHandler:
 
         except Exception as e:
             raise Exception(f"Failed to click element: {str(e)}")
+
+    @staticmethod
+    async def upload_files(
+        tab: Tab,
+        selector: str,
+        file_paths: List[str],
+        timeout: int = 10000
+    ) -> bool:
+        """
+        Attach one or more files to a file input via CDP DOM.setFileInputFiles.
+
+        This is the stealth-mcp equivalent of Playwright's set_input_files(): it
+        hands absolute paths directly to the browser, which opens and reads the
+        files itself. No synthetic File/DataTransfer in JS, no paperclip click.
+
+        Args:
+            tab (Tab): The browser tab object.
+            selector (str): CSS selector for the <input type="file"> element.
+            file_paths (List[str]): Absolute file paths to attach. The file
+                input must have the `multiple` attribute if more than one path
+                is given; otherwise the browser may reject the call.
+            timeout (int): Timeout in milliseconds for locating the input.
+
+        Returns:
+            bool: True on success.
+        """
+        try:
+            if not file_paths:
+                raise Exception("file_paths must contain at least one path")
+            abs_paths: List[str] = []
+            for p in file_paths:
+                if not p:
+                    raise Exception("Empty file path")
+                ap = os.path.abspath(p)
+                if not os.path.isfile(ap):
+                    raise FileNotFoundError(ap)
+                abs_paths.append(ap)
+            element = await tab.select(selector, timeout=timeout / 1000)
+            if not element:
+                raise Exception(f"File input not found: {selector}")
+            await element.send_file(*abs_paths)
+            return True
+        except Exception as e:
+            raise Exception(f"Failed to upload files: {str(e)}")
 
     @staticmethod
     async def type_text(

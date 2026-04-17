@@ -498,6 +498,40 @@ async def paste_text(
     return await dom_handler.paste_text(tab, selector, text, clear_first)
 
 @section_tool("element-interaction")
+async def upload_files(
+    instance_id: str,
+    selector: str,
+    files: List[str],
+    timeout: int = 10000
+) -> bool:
+    """
+    Attach one or more local files to a file input element.
+
+    Wraps CDP DOM.setFileInputFiles (via nodriver's Element.send_file), which
+    hands absolute host paths to the browser directly. Use this for Twitter
+    image uploads, Instagram/ad consoles, any <input type="file">. The file
+    input does not need to be visible; targeting the hidden input by selector
+    (e.g. 'input[data-testid="fileInput"]') is the intended usage. Do not
+    click the paperclip first.
+
+    Args:
+        instance_id (str): Browser instance ID.
+        selector (str): CSS selector for the file input element.
+        files (List[str]): Absolute file paths to attach. The element must
+            have the `multiple` attribute if more than one path is given.
+        timeout (int): Timeout in milliseconds for locating the input.
+
+    Returns:
+        bool: True if files were attached successfully.
+    """
+    if isinstance(timeout, str):
+        timeout = int(timeout)
+    tab = await browser_manager.get_tab(instance_id)
+    if not tab:
+        raise Exception(f"Instance not found: {instance_id}")
+    return await dom_handler.upload_files(tab, selector, files, timeout)
+
+@section_tool("element-interaction")
 async def select_option(
     instance_id: str,
     selector: str,
