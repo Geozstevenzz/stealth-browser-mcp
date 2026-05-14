@@ -27,6 +27,72 @@ from proxy_utils import (
 )
 
 
+async def _watch_browser_process(instance_id: str, proc: "asyncio.subprocess.Process") -> None:
+    """Drain Chrome's stderr into the log and record when the subprocess exits.
+
+    nodriver spawns Chrome with stderr=PIPE but does not consume it, so the pipe
+    eventually fills on Windows (~64KB buffer) and Chrome blocks. Draining it
+    both prevents that hang and gives us the real crash reason when Chrome dies.
+    """
+    stderr_reader = getattr(proc, "stderr", None)
+
+    async def _drain_stderr() -> None:
+        if stderr_reader is None:
+            return
+        try:
+            while True:
+                line = await stderr_reader.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if not text:
+                    continue
+                debug_logger.log_warning(
+                    "browser_subprocess",
+                    instance_id,
+                    f"stderr: {text}",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            debug_logger.log_error(
+                "browser_subprocess",
+                "stderr_drain",
+                exc,
+                context={"instance_id": instance_id},
+            )
+
+    drain_task = asyncio.create_task(
+        _drain_stderr(),
+        name=f"browser-stderr-{instance_id}",
+    )
+    try:
+        rc = await proc.wait()
+    except asyncio.CancelledError:
+        drain_task.cancel()
+        raise
+    except Exception as exc:
+        debug_logger.log_error(
+            "browser_subprocess",
+            "wait",
+            exc,
+            context={"instance_id": instance_id},
+        )
+        return
+    # Give stderr a short window to flush the final bytes after exit.
+    try:
+        await asyncio.wait_for(drain_task, timeout=1.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        drain_task.cancel()
+    except Exception:
+        pass
+    debug_logger.log_warning(
+        "browser_subprocess",
+        instance_id,
+        f"Chrome subprocess exited rc={rc} pid={getattr(proc, 'pid', None)}",
+    )
+
+
 def _parse_nonnegative_int_env(
     name: str,
     default: int,
@@ -347,8 +413,20 @@ class BrowserManager:
                     user_data_dir=actual_user_data_dir,
                     uses_custom_data_dir=uses_custom_data_dir,
                 )
+                try:
+                    asyncio.create_task(
+                        _watch_browser_process(instance_id, browser._process),
+                        name=f"browser-watchdog-{instance_id}",
+                    )
+                except Exception as exc:
+                    debug_logger.log_error(
+                        "browser_manager",
+                        "watchdog_start",
+                        exc,
+                        context={"instance_id": instance_id},
+                    )
             else:
-                debug_logger.log_warning("browser_manager", "spawn_browser", 
+                debug_logger.log_warning("browser_manager", "spawn_browser",
                                        f"Browser {instance_id} has no process to track")
 
             if options.extra_headers:

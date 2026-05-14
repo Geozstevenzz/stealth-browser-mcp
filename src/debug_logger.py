@@ -1,7 +1,10 @@
 import json
+import logging
 import sys
 import traceback
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Dict, List, Any, Optional
 from collections import defaultdict
 import threading
@@ -10,6 +13,17 @@ import gzip
 import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+
+class _FlushingRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that flushes after every record so lines survive a crash."""
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+            self.flush()
+        except Exception:
+            pass
 
 
 class DebugLogger:
@@ -38,6 +52,69 @@ class DebugLogger:
         import time
         self._lock_acquired_time = 0
         self._seen_errors: set = set()
+        self._file_logger: Optional[logging.Logger] = self._init_file_logger()
+
+    def _init_file_logger(self) -> Optional[logging.Logger]:
+        """Set up an always-on rotating file logger so logs survive crashes."""
+        try:
+            log_dir_env = os.getenv("STEALTH_BROWSER_LOG_DIR")
+            if log_dir_env:
+                log_dir = Path(log_dir_env)
+            else:
+                log_dir = Path(__file__).resolve().parent.parent / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            logger = logging.getLogger("stealth_browser_mcp")
+            logger.setLevel(logging.DEBUG)
+            logger.propagate = False
+
+            have_file_handler = any(
+                isinstance(h, RotatingFileHandler) for h in logger.handlers
+            )
+            if not have_file_handler:
+                handler = _FlushingRotatingFileHandler(
+                    log_dir / "server.log",
+                    maxBytes=5 * 1024 * 1024,
+                    backupCount=5,
+                    encoding="utf-8",
+                )
+                handler.setFormatter(
+                    logging.Formatter(
+                        "%(asctime)s.%(msecs)03d %(levelname)s pid=%(process)d %(message)s",
+                        datefmt="%Y-%m-%dT%H:%M:%S",
+                    )
+                )
+                logger.addHandler(handler)
+
+            logger.info(
+                "logger_init pid=%d python=%s cwd=%s",
+                os.getpid(),
+                sys.version.split()[0],
+                os.getcwd(),
+            )
+            return logger
+        except Exception as exc:
+            try:
+                print(f"[DEBUG] Failed to init file logger: {exc}", file=sys.stderr)
+            except Exception:
+                pass
+            return None
+
+    def _file_log(self, level: int, component: str, method: str, message: str, extra: Any = None):
+        """Write to the persistent file log. Safe if the file logger is unavailable."""
+        if self._file_logger is None:
+            return
+        try:
+            if extra is None:
+                self._file_logger.log(level, "%s.%s: %s", component, method, message)
+            else:
+                try:
+                    extra_str = json.dumps(extra, default=str)
+                except Exception:
+                    extra_str = repr(extra)
+                self._file_logger.log(level, "%s.%s: %s | %s", component, method, message, extra_str)
+        except Exception:
+            pass
 
     def _emit_stderr(self, message: str, force: bool = False):
         """
@@ -64,6 +141,15 @@ class DebugLogger:
             error (Exception): The exception instance.
             context (Optional[Dict[str, Any]]): Additional context for the error.
         """
+        tb = traceback.format_exc()
+        self._file_log(
+            logging.ERROR,
+            component,
+            method,
+            f"{type(error).__name__}: {error}",
+            extra={"traceback": tb, "context": context or {}},
+        )
+
         if not self._enabled:
             return
 
@@ -99,6 +185,8 @@ class DebugLogger:
             message (str): Warning message.
             context (Optional[Dict[str, Any]]): Additional context for the warning.
         """
+        self._file_log(logging.WARNING, component, method, message, extra=context)
+
         if not self._enabled:
             return
 
@@ -124,6 +212,8 @@ class DebugLogger:
             message (str): Info message.
             data (Optional[Any]): Additional data for the info log.
         """
+        self._file_log(logging.INFO, component, method, message, extra=data)
+
         if not self._enabled:
             return
 

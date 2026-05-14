@@ -1,6 +1,7 @@
 """Main MCP server for browser automation."""
 
 import asyncio
+import atexit
 import base64
 import importlib
 import json
@@ -8,6 +9,7 @@ import os
 import signal
 import sys
 import tempfile
+import traceback
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -57,6 +59,112 @@ DEBUG_LOGGING_ENABLED = (
     or parse_bool_env("DEBUG", default=False)
 )
 
+
+_CRASH_HOOKS_INSTALLED = False
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    """Log any unhandled exception to the persistent log before the process dies."""
+    try:
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        debug_logger.log_error(
+            "server",
+            "unhandled_exception",
+            exc_value if isinstance(exc_value, BaseException) else Exception(str(exc_value)),
+            context={"traceback": tb_text, "exc_type": getattr(exc_type, "__name__", str(exc_type))},
+        )
+    except Exception:
+        pass
+    try:
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    except Exception:
+        pass
+
+
+def _asyncio_exception_handler(loop, context):
+    """Route asyncio unhandled exceptions into the file log."""
+    exc = context.get("exception")
+    message = context.get("message", "unhandled asyncio exception")
+    if isinstance(exc, BaseException):
+        debug_logger.log_error(
+            "server",
+            "asyncio_unhandled",
+            exc if isinstance(exc, Exception) else Exception(repr(exc)),
+            context={"message": message, "asyncio_context": {k: repr(v) for k, v in context.items() if k != "exception"}},
+        )
+    else:
+        debug_logger.log_warning(
+            "server",
+            "asyncio_unhandled",
+            message,
+            context={k: repr(v) for k, v in context.items()},
+        )
+
+
+def _signal_handler(signum, frame):
+    """Log signal receipt before honoring default shutdown behavior."""
+    try:
+        sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+    except Exception:
+        sig_name = str(signum)
+    debug_logger.log_warning(
+        "server",
+        "signal_received",
+        f"sig={sig_name} signum={signum} pid={os.getpid()}",
+    )
+    # Preserve expected semantics: SIGINT raises KeyboardInterrupt so FastMCP
+    # shutdown / lifespan cleanup runs. Other signals exit with 128+signum.
+    if signum == getattr(signal, "SIGINT", None):
+        raise KeyboardInterrupt
+    try:
+        sys.exit(128 + signum)
+    except SystemExit:
+        raise
+
+
+def _atexit_handler():
+    debug_logger.log_info(
+        "server",
+        "atexit",
+        f"process exiting pid={os.getpid()}",
+    )
+
+
+def _install_crash_hooks():
+    global _CRASH_HOOKS_INSTALLED
+    if _CRASH_HOOKS_INSTALLED:
+        return
+    _CRASH_HOOKS_INSTALLED = True
+    try:
+        sys.excepthook = _excepthook
+    except Exception as exc:
+        debug_logger.log_error("server", "install_excepthook", exc)
+    try:
+        atexit.register(_atexit_handler)
+    except Exception as exc:
+        debug_logger.log_error("server", "install_atexit", exc)
+    for sig_name in ("SIGTERM", "SIGINT", "SIGBREAK"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _signal_handler)
+        except (ValueError, OSError, RuntimeError) as exc:
+            # signal.signal can fail in non-main threads; skip silently
+            debug_logger.log_warning(
+                "server",
+                "install_signal",
+                f"could not install handler for {sig_name}: {exc}",
+            )
+    debug_logger.log_info(
+        "server",
+        "crash_hooks",
+        f"installed pid={os.getpid()} platform={sys.platform}",
+    )
+
+
+_install_crash_hooks()
+
 def is_section_enabled(section: str) -> bool:
     """Check if a tool section is enabled."""
     return section not in DISABLED_SECTIONS
@@ -89,6 +197,10 @@ async def app_lifespan(server):
     """
     debug_logger.log_info("server", "startup", "Starting Browser Automation MCP Server...")
     try:
+        try:
+            asyncio.get_running_loop().set_exception_handler(_asyncio_exception_handler)
+        except Exception as exc:
+            debug_logger.log_warning("server", "asyncio_hook", f"failed to install: {exc}")
         await browser_manager.start_idle_reaper()
         yield
     finally:
