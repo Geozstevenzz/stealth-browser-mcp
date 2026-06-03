@@ -16,7 +16,27 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 
 class _FlushingRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler that flushes after every record so lines survive a crash."""
+    """RotatingFileHandler that flushes after every record so lines survive a crash.
+
+    Hardened against the Windows log-rotation race (WinError 32): when several
+    server instances run at once (e.g. an interactive session plus a headless
+    cron fire), the rename in doRollover can fail because another process holds
+    server.log. The base handler reports that via handleError, which spews a
+    traceback to stderr during import and can corrupt the MCP stdio handshake.
+    Here rollover failures are swallowed and the stream is kept usable, so a
+    locked log degrades to "skip rotation this round" instead of breaking startup.
+    """
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except (OSError, PermissionError):
+            # Another process holds the log file; skip rotation, keep appending.
+            try:
+                if self.stream is None:
+                    self.stream = self._open()
+            except Exception:
+                self.stream = None
 
     def emit(self, record):
         try:
@@ -77,6 +97,7 @@ class DebugLogger:
                     maxBytes=5 * 1024 * 1024,
                     backupCount=5,
                     encoding="utf-8",
+                    delay=True,
                 )
                 handler.setFormatter(
                     logging.Formatter(

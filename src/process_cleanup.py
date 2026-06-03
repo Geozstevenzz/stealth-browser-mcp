@@ -37,7 +37,34 @@ class ProcessCleanup:
             self.DEFAULT_ORPHAN_PROFILE_MAX_AGE_SECONDS,
         )
         self._setup_cleanup_handlers()
-        self._recover_orphaned_processes()
+        # Orphan recovery scans every system process via psutil and sweeps temp
+        # profile dirs, which can take ~12s. Running it inline here blocked the
+        # whole module import, and even on a plain background thread the CPU-bound
+        # psutil scan steals the GIL from the main thread, so the MCP server still
+        # took ~10s to register its tools -> stealth-browser-mcp showed up as
+        # "not available" in headless / scheduled-task `claude -p` sessions (which
+        # don't wait that long). Defer recovery on a daemon thread AND delay it a
+        # few seconds so tool registration / the MCP initialize handshake finish
+        # first. Recovery only cleans up orphans from prior runs, so running it a
+        # little later is harmless; if a very short session exits before it runs,
+        # the next longer-lived session sweeps the orphans instead.
+        import threading as _threading
+
+        def _deferred_recovery():
+            import time as _time
+            _time.sleep(
+                self._parse_nonnegative_int_env("BROWSER_ORPHAN_RECOVERY_DELAY", 8)
+            )
+            try:
+                self._recover_orphaned_processes()
+            except Exception:
+                pass
+
+        _threading.Thread(
+            target=_deferred_recovery,
+            name="stealth-orphan-recovery",
+            daemon=True,
+        ).start()
 
     @staticmethod
     def _parse_nonnegative_int_env(name: str, default: int) -> int:
