@@ -506,7 +506,8 @@ class BrowserManager:
                         pass
 
                 # psutil profile scans and process waits must not block MCP's loop.
-                await asyncio.to_thread(process_cleanup.kill_browser_process, instance_id)
+                if process is None or process.returncode is None:
+                    await asyncio.to_thread(process_cleanup.kill_browser_process, instance_id)
                 if process is not None and process.returncode is None:
                     try:
                         process.terminate()
@@ -518,7 +519,24 @@ class BrowserManager:
                         except Exception:
                             pass
 
-                alive = await asyncio.to_thread(process_cleanup.is_process_alive, instance_id)
+                metadata = process_cleanup.browser_processes.get(instance_id)
+                owned_custom_process_exited = (
+                    process is not None
+                    and process.returncode is not None
+                    and metadata is not None
+                    and metadata.get('pid') == process.pid
+                    and metadata.get('uses_custom_data_dir') is True
+                )
+                if owned_custom_process_exited:
+                    # The owned process exit is authoritative. Custom profiles
+                    # are retained, so no system-wide profile sweep is needed.
+                    if not await asyncio.to_thread(
+                        process_cleanup.untrack_browser_process, instance_id
+                    ):
+                        return False
+                    alive = False
+                else:
+                    alive = await asyncio.to_thread(process_cleanup.is_process_alive, instance_id)
                 if alive or (process is not None and process.returncode is None):
                     debug_logger.log_warning(
                         "browser_manager", "close_instance",

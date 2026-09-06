@@ -76,6 +76,27 @@ class CloseInstanceTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.manager.close_instance("owned"))
         self.assertNotIn("owned", self.manager._instances)
 
+    async def test_exited_owned_custom_browser_skips_slow_profile_sweeps(self):
+        self.cleanup.browser_processes["owned"]["uses_custom_data_dir"] = True
+
+        async def graceful_exit(command):
+            self.process.returncode = 0
+        self.browser.connection.send.side_effect = graceful_exit
+
+        def untrack(instance_id):
+            del self.cleanup.browser_processes[instance_id]
+            return True
+        self.cleanup.untrack_browser_process.side_effect = untrack
+
+        self.assertTrue(await self.manager.close_instance("owned"))
+
+        self.cleanup.kill_browser_process.assert_not_called()
+        self.cleanup.is_process_alive.assert_not_called()
+        self.cleanup.finalize_browser_process.assert_not_called()
+        self.cleanup.untrack_browser_process.assert_called_once_with("owned")
+        self.process.terminate.assert_not_called()
+        self.assertNotIn("owned", self.manager._instances)
+
 
 if __name__ == "__main__":
     unittest.main()
