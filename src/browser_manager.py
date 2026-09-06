@@ -1,6 +1,7 @@
 """Browser instance management with nodriver."""
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -733,34 +734,29 @@ class BrowserManager:
     async def _wait_for_navigation_condition(
         tab: Tab,
         wait_until: str,
-        timeout_seconds: float,
+        deadline: float,
+        frame_id: str,
+        loader_id: Optional[str],
+        milestones: set[tuple[str, str, str]],
+        changed: asyncio.Event,
     ) -> None:
-        """
-        Wait for a navigation milestone within the remaining timeout budget.
-
-        Args:
-            tab (Tab): Browser tab.
-            wait_until (str): Desired wait condition.
-            timeout_seconds (float): Remaining timeout budget in seconds.
-        """
-        if timeout_seconds <= 0:
-            raise asyncio.TimeoutError("Navigation wait budget exhausted")
-
-        if wait_until == "domcontentloaded":
-            await asyncio.wait_for(
-                tab.wait(uc.cdp.page.DomContentEventFired),
-                timeout=timeout_seconds,
-            )
-            return
-
-        if wait_until == "networkidle":
-            await asyncio.sleep(min(timeout_seconds, 2.0))
-            return
-
-        await asyncio.wait_for(
-            tab.wait(uc.cdp.page.LoadEventFired),
-            timeout=timeout_seconds,
-        )
+        """Wait for this navigation's loader, including events received before its reply."""
+        milestone = {"domcontentloaded": "DOMContentLoaded", "load": "load", "networkidle": "networkIdle"}[wait_until]
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("Navigation milestone budget exhausted")
+            if loader_id is None:
+                # A hash/history navigation has no new document or loader event.
+                ready = await asyncio.wait_for(tab.evaluate("document.readyState"), timeout=remaining)
+                if ready == "complete" or (wait_until == "domcontentloaded" and ready == "interactive"):
+                    return
+                await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            else:
+                if (frame_id, loader_id, milestone) in milestones:
+                    return
+                changed.clear()
+                await asyncio.wait_for(changed.wait(), timeout=remaining)
 
     async def navigate(
         self,
@@ -770,96 +766,82 @@ class BrowserManager:
         timeout: int = 30000,
         referrer: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Navigate with timeout enforcement and one automatic tab-recovery retry.
-
-        Args:
-            instance_id (str): Browser instance id.
-            url (str): Target URL.
-            wait_until (str): Wait condition after navigation.
-            timeout (int): Timeout in milliseconds.
-            referrer (Optional[str]): Optional referrer header.
-
-        Returns:
-            Dict[str, Any]: Navigation result payload.
-        """
+        """Navigate and optionally recover a stale tab within one overall deadline."""
+        if wait_until not in {"load", "domcontentloaded", "networkidle"}:
+            raise ValueError(f"Unsupported navigation wait condition: {wait_until}")
         timeout_seconds = max(timeout, 1) / 1000
-        last_error: Optional[Exception] = None
+        deadline = time.monotonic() + timeout_seconds
 
-        for attempt in range(2):
-            await self.touch_instance(instance_id)
-            if attempt == 0:
-                tab = await self.get_navigation_tab(instance_id)
-            else:
-                tab = await self._replace_main_tab(
-                    instance_id,
-                    reason=f"recovering after navigation failure: {type(last_error).__name__ if last_error else 'unknown'}",
-                )
-
-            if not tab:
-                raise Exception(f"Instance not found: {instance_id}")
-
-            start_time = time.monotonic()
-
-            try:
-                if referrer:
-                    await tab.send(
-                        uc.cdp.network.set_extra_http_headers(
-                            headers={"Referer": referrer}
-                        )
+        async def _navigate():
+            last_error: Optional[Exception] = None
+            for attempt in range(2):
+                await self.touch_instance(instance_id)
+                if attempt == 0:
+                    tab = await self.get_navigation_tab(instance_id)
+                else:
+                    tab = await self._replace_main_tab(
+                        instance_id,
+                        reason=f"recovering after navigation failure: {type(last_error).__name__}",
                     )
+                if not tab:
+                    raise Exception(f"Instance not found: {instance_id}")
 
-                await asyncio.wait_for(tab.get(url), timeout=timeout_seconds)
+                milestones: set[tuple[str, str, str]] = set()
+                changed = asyncio.Event()
 
-                elapsed = time.monotonic() - start_time
-                await self._wait_for_navigation_condition(
-                    tab,
-                    wait_until,
-                    timeout_seconds - elapsed,
-                )
+                def on_lifecycle(event, connection=None):
+                    milestones.add((str(event.frame_id), str(event.loader_id), event.name))
+                    changed.set()
 
-                elapsed = time.monotonic() - start_time
-                remaining = timeout_seconds - elapsed
-                if remaining <= 0:
-                    raise asyncio.TimeoutError("Navigation result budget exhausted")
+                tab.add_handler(uc.cdp.page.LifecycleEvent, on_lifecycle)
+                try:
+                    # Register before navigation so cached/fast documents cannot
+                    # deliver their milestone before a listener exists.
+                    await tab.send(uc.cdp.page.enable())
+                    await tab.send(uc.cdp.page.set_lifecycle_events_enabled(True))
+                    frame_id, loader_id, error_text = await tab.send(
+                        uc.cdp.page.navigate(url, referrer=referrer)
+                    )
+                    if error_text:
+                        raise Exception(f"Navigation failed: {error_text}")
+                    tab.frame_id = frame_id
+                    await self._wait_for_navigation_condition(
+                        tab, wait_until, deadline, str(frame_id),
+                        None if loader_id is None else str(loader_id), milestones, changed,
+                    )
+                    # Read the redirected URL and title from the same document
+                    # in one bounded operation, not separate reused budgets.
+                    result = json.loads(await tab.evaluate(
+                        "JSON.stringify({url: window.location.href, title: document.title})"
+                    ))
+                    await self.update_instance_state(instance_id, result["url"], result["title"])
+                    async with self._lock:
+                        if instance_id in self._instances:
+                            self._instances[instance_id]["tab"] = tab
+                            self._instances[instance_id]["navigation_count"] = (
+                                self._instances[instance_id].get("navigation_count", 0) + 1
+                            )
+                    return {"url": result["url"], "title": result["title"], "success": True}
+                except Exception as error:
+                    last_error = error
+                    debug_logger.log_warning(
+                        "browser_manager", "navigate",
+                        f"Navigation attempt {attempt + 1} failed for {instance_id}: {error}",
+                    )
+                    if attempt == 1 or time.monotonic() >= deadline or not self._is_recoverable_navigation_error(error):
+                        raise
+                finally:
+                    # nodriver.remove_handler removes other consumers too.
+                    callbacks = tab.handlers.get(uc.cdp.page.LifecycleEvent, [])
+                    if on_lifecycle in callbacks:
+                        callbacks.remove(on_lifecycle)
+                    if not callbacks:
+                        tab.handlers.pop(uc.cdp.page.LifecycleEvent, None)
 
-                final_url = await asyncio.wait_for(
-                    tab.evaluate("window.location.href"),
-                    timeout=remaining,
-                )
-                title = await asyncio.wait_for(
-                    tab.evaluate("document.title"),
-                    timeout=remaining,
-                )
-
-                await self.update_instance_state(instance_id, final_url, title)
-
-                async with self._lock:
-                    if instance_id in self._instances:
-                        self._instances[instance_id]["tab"] = tab
-                        self._instances[instance_id]["navigation_count"] = (
-                            self._instances[instance_id].get("navigation_count", 0) + 1
-                        )
-
-                return {
-                    "url": final_url,
-                    "title": title,
-                    "success": True,
-                }
-            except Exception as error:
-                last_error = error
-                debug_logger.log_warning(
-                    "browser_manager",
-                    "navigate",
-                    f"Navigation attempt {attempt + 1} failed for {instance_id}: {error}",
-                    {"url": url, "attempt": attempt + 1},
-                )
-                if attempt == 1 or not self._is_recoverable_navigation_error(error):
-                    if isinstance(error, asyncio.TimeoutError):
-                        raise Exception(
-                            f"Navigation to {url} timed out after {timeout}ms"
-                        ) from error
-                    raise
+        try:
+            return await asyncio.wait_for(_navigate(), timeout=timeout_seconds)
+        except asyncio.TimeoutError as error:
+            raise TimeoutError(f"Navigation to {url} timed out after {timeout}ms total") from error
 
     async def get_tab(
         self,
