@@ -185,7 +185,7 @@ class BrowserManager:
                 await asyncio.sleep(self._idle_reaper_interval_seconds)
                 try:
                     closed_count = await self.cleanup_inactive()
-                    finalized_profiles = process_cleanup.cleanup_deferred_profiles()
+                    finalized_profiles = await asyncio.to_thread(process_cleanup.cleanup_deferred_profiles)
                     if closed_count:
                         debug_logger.log_info(
                             "browser_manager",

@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+import asyncio
+import threading
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -14,6 +16,28 @@ with patch("threading.Thread.start"), patch("atexit.register"), patch("signal.si
 
 
 class CloseInstanceTest(unittest.IsolatedAsyncioTestCase):
+    async def test_profile_scan_does_not_run_on_browser_event_loop(self):
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        thread_ids = []
+
+        def scan():
+            thread_ids.append(threading.get_ident())
+            loop.call_soon_threadsafe(started.set)
+            return 0
+
+        self.manager._idle_reaper_interval_seconds = 0
+        self.manager.cleanup_inactive = AsyncMock(return_value=0)
+        self.cleanup.cleanup_deferred_profiles.side_effect = scan
+        task = asyncio.create_task(self.manager._run_idle_reaper())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            self.assertNotEqual(thread_ids[0], threading.get_ident())
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
     def setUp(self):
         self.order = []
         self.process = SimpleNamespace(
