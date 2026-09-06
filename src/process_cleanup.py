@@ -477,34 +477,15 @@ class ProcessCleanup:
 
     def _recover_orphaned_processes(self):
         """
-        Recover from previous-run orphan browsers and abandoned temp profiles.
+        Sweep abandoned temporary profiles without terminating live browsers.
 
         Returns:
             None
         """
-        saved_processes = self._load_tracked_pids()
-        recovered_count = 0
-
-        for instance_id, metadata in saved_processes.items():
-            try:
-                if self._kill_processes_for_metadata(instance_id, metadata):
-                    recovered_count += 1
-                self._cleanup_profile_for_metadata(instance_id, metadata)
-            except Exception as error:
-                debug_logger.log_warning(
-                    "process_cleanup",
-                    "recovery",
-                    f"Failed recovering {instance_id}: {error}",
-                )
-
-        if recovered_count:
-            debug_logger.log_info(
-                "process_cleanup",
-                "recovery",
-                f"Killed {recovered_count} orphaned browser processes",
-            )
-
-        self._clear_pid_file()
+        # The registry is shared by MCP processes and can already contain a
+        # browser launched during the startup delay. Neither its presence nor
+        # its age proves that a browser is orphaned. Normal instance shutdown
+        # remains responsible for stopping browsers owned by that instance.
         self._sweep_orphaned_temp_profiles()
 
     def track_browser_process(

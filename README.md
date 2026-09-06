@@ -475,7 +475,7 @@ Use `python src/server.py --debug` or set `STEALTH_BROWSER_DEBUG=1`. Debug logs 
 Run with `--sandbox=false` or ensure your environment supports sandboxing. The server auto-detects root and container environments and adjusts accordingly.
 
 **Orphan Chromium processes or `uc_*` temp profiles accumulate on long-running hosts**
-The server now reaps idle browser instances automatically and performs startup cleanup of tracked orphan browser processes plus stale `uc_*` temp profiles. Set `BROWSER_IDLE_TIMEOUT=0` to disable idle reaping if you want fully manual browser lifetime management.
+The server reaps its own idle browser instances automatically. Startup cleanup removes only stale `uc_*` temp profiles that are not in use. It never terminates browsers from the shared PID registry, which can contain browsers owned by another running session or launched during startup. Use `close_instance` to stop an instance when finished. Set `BROWSER_IDLE_TIMEOUT=0` to disable idle reaping if you want fully manual browser lifetime management.
 
 **Too many tools cluttering the AI chat**
 Use `--minimal` for 22 core tools, or selectively disable sections:

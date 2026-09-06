@@ -186,9 +186,11 @@ class DOMHandler:
             await asyncio.sleep(0.5)
 
             try:
-                await element.click()
-            except Exception:
+                # Dispatch a browser mouse event so controls requiring trusted
+                # pointer input receive the same event as a user's click.
                 await element.mouse_click()
+            except Exception:
+                await element.click()
 
             return True
 
