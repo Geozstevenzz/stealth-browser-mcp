@@ -14,6 +14,8 @@ from debug_logger import debug_logger
 class DOMHandler:
     """Handles DOM queries and element interactions."""
 
+    SCRIPT_TIMEOUT_SECONDS = 15.0
+
     @staticmethod
     async def query_elements(
         tab: Tab,
@@ -544,12 +546,18 @@ class DOMHandler:
         try:
             if args:
                 serialized_args = ",".join(json.dumps(a) for a in args)
-                result = await tab.evaluate(f'(function() {{ {script} }})({serialized_args})')
+                evaluation = tab.evaluate(f'(function() {{ {script} }})({serialized_args})')
             else:
-                result = await tab.evaluate(script)
+                evaluation = tab.evaluate(script)
+
+            result = await asyncio.wait_for(evaluation, timeout=DOMHandler.SCRIPT_TIMEOUT_SECONDS)
 
             return result
 
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"Script execution timed out after {DOMHandler.SCRIPT_TIMEOUT_SECONDS:g} seconds; browser did not respond"
+            ) from e
         except Exception as e:
             raise Exception(f"Failed to execute script: {str(e)}")
 

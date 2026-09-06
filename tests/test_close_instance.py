@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-with patch("threading.Thread.start"), patch("atexit.register"), patch("signal.signal"):
+with patch("threading.Thread.start"), patch("atexit.register"), patch("signal.signal"), \
+        patch("psutil.process_iter", return_value=[]), patch("pathlib.Path.glob", return_value=[]):
     module = importlib.import_module("browser_manager")
 
 
@@ -49,7 +50,7 @@ class CloseInstanceTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.manager.close_instance("owned"))
 
         self.assertEqual(self.order, ["close", "disconnect", "fallback"])
-        self.process.wait.assert_awaited_once()
+        self.process.wait.assert_awaited()
         self.cleanup.finalize_browser_process.assert_called_once_with("owned")
         self.assertNotIn("owned", self.manager._instances)
         self.assertEqual(self.instance.state, module.BrowserState.CLOSED)
@@ -96,6 +97,26 @@ class CloseInstanceTest(unittest.IsolatedAsyncioTestCase):
         self.cleanup.untrack_browser_process.assert_called_once_with("owned")
         self.process.terminate.assert_not_called()
         self.assertNotIn("owned", self.manager._instances)
+
+    async def test_grace_wait_observes_delayed_exit_before_process_scan(self):
+        self.cleanup.browser_processes["owned"]["uses_custom_data_dir"] = True
+
+        async def exit_after_close():
+            self.process.returncode = 0
+            return 0
+        self.process.wait.side_effect = exit_after_close
+
+        def untrack(instance_id):
+            del self.cleanup.browser_processes[instance_id]
+            return True
+        self.cleanup.untrack_browser_process.side_effect = untrack
+
+        self.assertTrue(await self.manager.close_instance("owned"))
+
+        self.process.wait.assert_awaited_once()
+        self.cleanup.kill_browser_process.assert_not_called()
+        self.cleanup.is_process_alive.assert_not_called()
+        self.cleanup.finalize_browser_process.assert_not_called()
 
 
 if __name__ == "__main__":

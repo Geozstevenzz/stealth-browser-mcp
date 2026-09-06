@@ -505,6 +505,14 @@ class BrowserManager:
                     except Exception:
                         pass
 
+                # Chrome may acknowledge Browser.close before its process exits.
+                # Give that owned process a brief grace period before slow scans.
+                if process is not None and process.returncode is None:
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=3.0)
+                    except Exception:
+                        pass
+
                 # psutil profile scans and process waits must not block MCP's loop.
                 if process is None or process.returncode is None:
                     await asyncio.to_thread(process_cleanup.kill_browser_process, instance_id)
@@ -561,6 +569,7 @@ class BrowserManager:
                 data['instance'].state = BrowserState.CLOSED
                 del self._instances[instance_id]
                 self._spawn_diagnostics.pop(instance_id, None)
+                dynamic_hook_system.remove_instance(instance_id)
                 persistent_storage.remove_instance(instance_id)
                 return True
 

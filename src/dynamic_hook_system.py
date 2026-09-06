@@ -63,6 +63,7 @@ class DynamicHook:
         self.trigger_count = 0
         self.last_triggered: Optional[datetime] = None
         self.status = "active"
+        self.instance_ids = set()
         self.request_stage = requirements.get('stage', 'request')  # 'request' or 'response'
         
         self._compiled_function = self._compile_function()
@@ -162,11 +163,15 @@ class DynamicHookSystem:
     def __init__(self):
         self.hooks: Dict[str, DynamicHook] = {}
         self.instance_hooks: Dict[str, List[str]] = {}  # instance_id -> list of hook_ids
+        self._tabs: Dict[str, Any] = {}
+        self._handlers: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
     
     async def setup_interception(self, tab, instance_id: str):
         """Set up request and response interception for a browser tab."""
         try:
+            self._tabs[instance_id] = tab
+            self.add_instance(instance_id)
             all_hooks = []
             
             instance_hook_ids = self.instance_hooks.get(instance_id, [])
@@ -206,17 +211,24 @@ class DynamicHookSystem:
             all_patterns = request_patterns + response_patterns
             
             if not all_patterns:
-                all_patterns = [
-                    uc.cdp.fetch.RequestPattern(url_pattern='*', request_stage=uc.cdp.fetch.RequestStage.REQUEST),
-                    uc.cdp.fetch.RequestPattern(url_pattern='*', request_stage=uc.cdp.fetch.RequestStage.RESPONSE)
-                ]
-            
-            await tab.send(uc.cdp.fetch.enable(patterns=all_patterns))
-            
-            tab.add_handler(
-                uc.cdp.fetch.RequestPaused,
-                lambda event: asyncio.create_task(self._on_request_paused(tab, event, instance_id))
-            )
+                handler = self._handlers.get(instance_id)
+                if handler is not None:
+                    await asyncio.wait_for(tab.send(uc.cdp.fetch.disable()), timeout=10.0)
+                    self._handlers.pop(instance_id, None)
+                    # Remove only our callback. nodriver's remove_handler removes
+                    # every callback for this event, including other consumers.
+                    callbacks = tab.handlers.get(uc.cdp.fetch.RequestPaused, [])
+                    if handler in callbacks:
+                        callbacks.remove(handler)
+                    if not callbacks:
+                        tab.handlers.pop(uc.cdp.fetch.RequestPaused, None)
+                return
+
+            if instance_id not in self._handlers:
+                handler = lambda event: asyncio.create_task(self._on_request_paused(tab, event, instance_id))
+                self._handlers[instance_id] = handler
+                tab.add_handler(uc.cdp.fetch.RequestPaused, handler)
+            await asyncio.wait_for(tab.send(uc.cdp.fetch.enable(patterns=all_patterns)), timeout=10.0)
             
             debug_logger.log_info("dynamic_hook_system", "setup_interception", f"Set up interception for instance {instance_id} with {len(all_patterns)} patterns ({len(request_patterns)} request, {len(response_patterns)} response)")
             
@@ -339,6 +351,7 @@ class DynamicHookSystem:
         try:
             hook_id = str(uuid.uuid4())
             hook = DynamicHook(hook_id, name, requirements, function_code, priority)
+            hook.instance_ids = set(instance_ids or [])
             
             async with self._lock:
                 self.hooks[hook_id] = hook
@@ -351,6 +364,10 @@ class DynamicHookSystem:
                 else:
                     for instance_id in self.instance_hooks:
                         self.instance_hooks[instance_id].append(hook_id)
+
+            for instance_id in instance_ids or list(self._tabs):
+                if instance_id in self._tabs:
+                    await self.setup_interception(self._tabs[instance_id], instance_id)
             
             debug_logger.log_info("dynamic_hook_system", "create_hook", f"Created hook {name} with ID {hook_id}")
             return hook_id
@@ -404,10 +421,12 @@ class DynamicHookSystem:
                         if hook_id in self.instance_hooks[instance_id]:
                             self.instance_hooks[instance_id].remove(hook_id)
                     
-                    debug_logger.log_info("dynamic_hook_system", "remove_hook", f"Removed hook {hook_id}")
-                    return True
-            
-            return False
+                else:
+                    return False
+            for instance_id, tab in list(self._tabs.items()):
+                await self.setup_interception(tab, instance_id)
+            debug_logger.log_info("dynamic_hook_system", "remove_hook", f"Removed hook {hook_id}")
+            return True
             
         except Exception as e:
             debug_logger.log_error("dynamic_hook_system", "remove_hook", f"Failed to remove hook {hook_id}: {e}")
@@ -416,7 +435,16 @@ class DynamicHookSystem:
     def add_instance(self, instance_id: str):
         """Add a new browser instance."""
         if instance_id not in self.instance_hooks:
-            self.instance_hooks[instance_id] = []
+            self.instance_hooks[instance_id] = [
+                hook_id for hook_id, hook in self.hooks.items()
+                if not hook.instance_ids or instance_id in hook.instance_ids
+            ]
+
+    def remove_instance(self, instance_id: str):
+        """Release references after the browser has been confirmed closed."""
+        self.instance_hooks.pop(instance_id, None)
+        self._tabs.pop(instance_id, None)
+        self._handlers.pop(instance_id, None)
     
     async def _execute_hook_action(self, tab, request: RequestInfo, action: HookAction, event=None):
         """Execute a hook action for either request or response stage."""
